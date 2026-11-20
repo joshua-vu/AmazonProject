@@ -1,0 +1,279 @@
+---
+title: "Regression Group Project: Exploratory Data Analysis"
+subtitle: "Response Relationships, Predictor Structure, Transformations, and Interactions"
+author: "Group project — Group 40"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: pdflatex
+    fig_caption: true
+geometry: margin=0.85in
+header-includes:
+  - \usepackage{float}
+  - \usepackage{placeins}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE,
+                      fig.width=6.7, fig.height=4.0, dpi=110,
+                      fig.align="center", fig.pos="H", out.width="95%")
+required <- c("dplyr", "readr", "ggplot2")
+missing_packages <- setdiff(required, rownames(installed.packages()))
+if (length(missing_packages)) stop("Install these R packages before knitting: ", paste(missing_packages, collapse=", "))
+library(dplyr)
+library(readr)
+library(ggplot2)
+theme_set(theme_minimal(base_size=11))
+set.seed(101)
+```
+
+## Data and purpose
+
+This analysis studies possible associations between Amazon purchasing behavior and the numeric household-size response. The expanded EDA examines predictor-predictor correlations, transformations, and potential interactions as well as relationships with the outcome. The unit of prediction is a survey respondent, not an individual purchase. Therefore, we aggregate all purchase rows associated with each respondent before joining to the labeled survey training data. We do not use household-size labels from the test set.
+
+```{r load}
+stopifnot(file.exists("amazon-purchases.csv"))
+if (!file.exists("survey_train_test.csv")) {
+  stop("Missing survey_train_test.csv. Put the Kaggle training file beside this Rmd and amazon-purchases.csv.")
+}
+purchases <- read_csv("amazon-purchases.csv", show_col_types=FALSE, progress=FALSE)
+survey <- read_csv("survey_train_test.csv", show_col_types=FALSE, progress=FALSE)
+stopifnot(all(c("Survey ResponseID", "Order Date", "Purchase Price Per Unit", "Quantity", "Category") %in% names(purchases)))
+stopifnot(all(c("Survey.ResponseID", "Q.amazon.use.hh.size.num", "test") %in% names(survey)))
+survey <- survey %>% rename(`Survey ResponseID` = Survey.ResponseID)
+```
+
+## Customer-level aggregation
+
+To prevent a user with many purchases from being counted repeatedly, aggregate orders by `Survey ResponseID`. Counts, spending, category variety, and transaction prices may capture different aspects of household behavior. We also retain purchase-history duration so that high purchasing volume can be distinguished from a longer observation period. Monetary spending is computed as price per unit times quantity; it should be interpreted with caution if these purchase records contain atypical high-price items or returns.
+
+```{r features}
+purchases <- purchases %>%
+  mutate(
+    order_date = as.Date(`Order Date`),
+    unit_price = as.numeric(`Purchase Price Per Unit`),
+    quantity = as.numeric(Quantity),
+    line_spend = unit_price * quantity,
+    category_clean = na_if(trimws(as.character(Category)), "")
+  )
+
+customer <- purchases %>%
+  group_by(`Survey ResponseID`) %>%
+  summarise(
+    n_purchase_rows = n(),
+    total_spend = sum(line_spend, na.rm=TRUE),
+    mean_unit_price = mean(unit_price, na.rm=TRUE),
+    total_quantity = sum(quantity, na.rm=TRUE),
+    unique_categories = n_distinct(category_clean, na.rm=TRUE),
+    first_purchase = min(order_date, na.rm=TRUE),
+    last_purchase = max(order_date, na.rm=TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mean_unit_price = ifelse(is.finite(mean_unit_price), mean_unit_price, NA_real_),
+    history_days = pmax(1, as.numeric(last_purchase - first_purchase) + 1),
+    purchase_rows_per_month = n_purchase_rows / pmax(1, history_days / 30.44),
+    log_purchase_rows = log1p(n_purchase_rows),
+    log_total_spend = log1p(pmax(0, total_spend)),
+    log_mean_unit_price = log1p(pmax(0, mean_unit_price)),
+    log_total_quantity = log1p(pmax(0, total_quantity)),
+    log_purchase_frequency = log1p(purchase_rows_per_month)
+  )
+
+# Training set only: no test observations can influence response-based plots.
+# Household-size labels are available only for training rows.
+
+labeled_survey <- survey %>%
+  filter(!is.na(`Q.amazon.use.hh.size.num`),
+         tolower(trimws(as.character(test))) %in% c("0", "false", "f"))
+stopifnot(!anyDuplicated(labeled_survey$`Survey ResponseID`))
+eda <- labeled_survey %>%
+  inner_join(customer, by="Survey ResponseID") %>%
+  mutate(
+    household_size = suppressWarnings(as.numeric(`Q.amazon.use.hh.size.num`)),
+    household_group = factor(household_size),
+    gender_group = as.character(Q.demos.gender),
+    gender_group = ifelse(is.na(gender_group) | trimws(gender_group) == "",
+                          "Missing", gender_group)
+  ) %>%
+  filter(is.finite(household_size), household_size >= 1)
+stopifnot(nrow(eda) == nrow(labeled_survey))
+stopifnot(nrow(eda) > 0L)
+cat("Labeled respondents available for EDA:", nrow(eda), "\n")
+cat("Unique purchase respondents:", nrow(customer), "\n")
+print(summary(select(eda, household_size, n_purchase_rows, total_spend,
+                     total_quantity, unique_categories, purchase_rows_per_month)))
+```
+
+## 1. Distribution of household size
+
+```{r eda1, fig.cap="Distribution of reported household sizes among labeled training respondents."}
+ggplot(eda, aes(x=household_group)) +
+  geom_bar(fill="#34699a") +
+  labs(x="Household size", y="Respondents", title="Training-set household-size distribution")
+```
+
+Interpretation: The distribution of household sizes is relatively balanced, although two-person households represent the largest group at 31.6% of respondents. One-person and four-person households account for 24.2% and 23.9%, respectively, while three-person households are least common at 20.3%. This suggests that the training data provides reasonable representation across all four household-size categories, reducing concerns about severe outcome imbalance.
+
+## 2. Purchase count by household size
+
+```{r eda2, fig.cap="Distribution of log-transformed purchase counts across household sizes."}
+ggplot(eda, aes(x=household_group, y=log_purchase_rows)) +
+  geom_boxplot(fill="#83b9dc", outlier.alpha=.12) +
+  labs(x="Household size", y="log(1 + purchase rows)", title="Purchase volume and household size")
+```
+
+Interpretation: Purchase volume exhibits a weak positive association with household size, with a Spearman correlation of approximately 0.061. Four-person households have the highest median purchase count at 268, compared with 204 for single-person households. However, three-person households have a lower median than two-person households, and substantial overlap exists between groups. This indicates that purchase volume alone is unlikely to accurately predict household size.
+
+## 3. Total spending by household size
+
+```{r eda3, fig.cap="Distribution of log-transformed total recorded spend across household sizes."}
+ggplot(eda, aes(x=household_group, y=log_total_spend)) +
+  geom_boxplot(fill="#a7d6bb", outlier.alpha=.12) +
+  labs(x="Household size", y="log(1 + total spend)", title="Recorded spending and household size")
+```
+
+Interpretation: Total Amazon spending shows a weak positive association with household size, with a Spearman correlation of approximately 0.069. Median spending increases from $4,882 for single-person households to 6,523 for four-person households. However, the relationship is not strictly increasing, as three-person households spend less than two-person households at the median. The considerable variability suggests that spending may contribute predictive information but is insufficient as an independent predictor.
+
+
+## 4. Product-category diversity by household size
+
+```{r eda4, fig.cap="Number of distinct product categories purchased, by household size."}
+ggplot(eda, aes(x=household_group, y=unique_categories)) +
+  geom_boxplot(fill="#eec8a0", outlier.alpha=.12) +
+  labs(x="Household size", y="Number of distinct categories", title="Shopping diversity and household size")
+```
+
+Interpretation: Product-category diversity demonstrates a weak positive relationship with household size, with a Spearman correlation of approximately 0.072. Four-person households purchase from a median of 122 distinct categories, compared with 91 for single-person households. Although larger households generally exhibit greater purchasing diversity, the relationship is not strictly increasing across household sizes. Category diversity may provide useful information, but its strong association with purchase count suggests that some of its predictive information may be redundant.
+
+## 5. Total spending versus purchase count (predictor-to-predictor)
+
+```{r eda5, fig.cap="Association between log-transformed purchase count and total spending, with a fitted linear trend for visual reference."}
+ggplot(eda, aes(x=log_purchase_rows, y=log_total_spend)) +
+  geom_point(alpha=.18, size=.8, color="#32669a") +
+  geom_smooth(method="lm", se=FALSE, color="#ad583b") +
+  labs(x="log(1 + purchase rows)", y="log(1 + total spending)",
+       title="Spending and purchase count: possible redundancy")
+```
+
+Interpretation: Total spending and purchase count exhibit a very strong positive relationship, with a Spearman correlation of approximately 0.944. Respondents who make more purchases generally accumulate greater total spending, indicating that both variables measure similar aspects of purchasing activity. This strong correlation raises concerns about multicollinearity when including both predictors in a linear regression model. Comparing models with different combinations of these variables may help identify the most effective specification.
+
+
+## 6. Correlation heatmap among predictors
+
+```{r eda6, fig.width=7.0, fig.height=5.4, fig.cap="Spearman correlation among respondent-level numeric predictors, excluding the outcome."}
+predictor_vars <- c("log_purchase_rows", "log_total_spend", "log_mean_unit_price",
+                    "log_total_quantity", "unique_categories", "log_purchase_frequency",
+                    "history_days")
+cor_mat <- cor(as.data.frame(eda[, predictor_vars]),
+               use="pairwise.complete.obs", method="spearman")
+cor_long <- as.data.frame(as.table(cor_mat))
+names(cor_long) <- c("Predictor_1", "Predictor_2", "Spearman_rho")
+ggplot(cor_long, aes(x=Predictor_1, y=Predictor_2, fill=Spearman_rho)) +
+  geom_tile(color="white") +
+  geom_text(aes(label=sprintf("%.2f", Spearman_rho)), size=3) +
+  scale_fill_gradient2(low="#a6473c", mid="white", high="#275b95",
+                       midpoint=0, limits=c(-1, 1)) +
+  coord_equal() +
+  labs(x=NULL, y=NULL, fill="Spearman rho", title="Correlations among predictors") +
+  theme(axis.text.x=element_text(angle=45, hjust=1))
+```
+
+Interpretation: The correlation heatmap reveals substantial relationships among several purchasing variables. Purchase count and total quantity exhibit an exceptionally strong positive correlation of 0.997, while purchase count and category diversity have a correlation of 0.961. Purchase frequency is also strongly associated with purchase count at 0.976. These findings indicate considerable redundancy among predictors, suggesting that feature selection, regularization, or alternative representations may help improve model stability and interpretability.
+
+## 7. Gender and household size: exploratory interaction
+
+```{r eda7, fig.width=7.0, fig.height=4.5, fig.cap="Monthly purchase intensity by household size, with separate gender groups; only training observations are used."}
+
+# Gender is available at prediction time, unlike many survey-only variables.
+
+ggplot(eda, aes(x=household_group, y=log_purchase_frequency,
+                fill=gender_group)) +
+  geom_boxplot(outlier.alpha=.07, width=.7, position=position_dodge2(preserve="single")) +
+  labs(x="Household size", y="log(1 + purchase rows per month)",
+       fill="Reported gender", title="Shopping frequency by household size and gender") +
+  theme(legend.position="bottom")
+```
+
+Interpretation: Purchasing frequency varies across both household size and reported gender. Among female respondents, median monthly purchasing frequency increases from approximately 4.47 purchases for single-person households to 6.07 for four-person households. Male respondents exhibit lower median purchasing frequencies of approximately 3.02 and 3.97, respectively. These differences suggest that demographic characteristics may help explain purchasing patterns, although further modeling is required to determine whether gender meaningfully improves household-size prediction.
+
+## 8. Spending distribution before and after log transformation
+
+```{r eda8, fig.width=7.0, fig.height=4.1, fig.cap="Raw total spending and log-transformed total spending; each histogram uses its own horizontal scale."}
+
+# Use two panels to compare shape, not numerical units.
+
+spending_plot_data <- rbind(
+  data.frame(value=eda$total_spend, scale="Raw spending"),
+  data.frame(value=eda$log_total_spend, scale="log(1 + spending)")
+)
+ggplot(spending_plot_data, aes(x=value)) +
+  geom_histogram(bins=45, fill="#427ca5", color="white") +
+  facet_wrap(~scale, scales="free_x", ncol=2) +
+  labs(x="Value (panel-specific scale)", y="Respondents",
+       title="Distribution of spending: why transform?")
+```
+
+Interpretation: Total spending exhibits substantial positive skewness, with a median of approximately $5,726 compared with a maximum of 81,319. This indicates that a relatively small number of high-spending respondents contribute extreme observations, potentially influencing regression estimates. Applying a log transformation compresses large spending values and reduces the visual dominance of outliers. This transformation may improve numerical stability and make relationships easier to analyze, although its predictive benefit should be evaluated through cross-validation.
+
+## 9. Total quantity by household size
+
+```{r eda9, fig.cap="Total quantity purchased on a log scale, grouped by training-set household size."}
+ggplot(eda, aes(x=household_group, y=log_total_quantity)) +
+  geom_boxplot(fill="#f0a9a0", outlier.alpha=.12) +
+  labs(x="Household size", y="log(1 + total units)",
+       title="Total units purchased and household size")
+```
+
+Interpretation: Total quantity purchased exhibits a weak positive association with household size, with a Spearman correlation of approximately 0.061. Four-person households purchase a median of 287 units, compared with 213 units for single-person households. However, the relationship is not consistently increasing, and distributions overlap considerably. Furthermore, the extremely high correlation between total quantity and purchase count suggests that including both variables may provide limited additional predictive information.
+
+## 10. Purchase frequency by household size
+
+```{r eda10, fig.cap="Monthly purchasing intensity across training household-size groups."}
+ggplot(eda, aes(x=household_group, y=log_purchase_frequency)) +
+  geom_boxplot(fill="#97c9d0", outlier.alpha=.12) +
+  labs(x="Household size", y="log(1 + purchase rows per month)",
+       title="Purchase frequency and household size")
+```
+
+Interpretation: Purchase frequency demonstrates a weak positive association with household size, with a Spearman correlation of approximately 0.081. Four-person households have the highest median purchasing frequency at approximately 5.07 purchase records per month, compared with 3.57 for single-person households. Although this relationship remains relatively weak, purchase frequency shows a slightly stronger association with household size than raw purchase count. Adjusting for purchasing-history duration may therefore provide useful information for prediction.
+
+## 11. Purchase count, category diversity, and household size
+
+```{r eda11, fig.cap="Category diversity versus purchase count, colored by the training household-size outcome."}
+ggplot(eda, aes(x=log_purchase_rows, y=unique_categories,
+                color=household_group)) +
+  geom_point(alpha=.50, size=1.1) +
+  labs(x="log(1 + purchase rows)", y="Distinct categories",
+       color="Household size",
+       title="Shopping intensity, product diversity, and household size")
+```
+
+Interpretation: Purchase count and product-category diversity exhibit a strong positive association, with a Spearman correlation of approximately 0.961. Respondents with greater purchasing activity generally purchase from more distinct categories. However, both variables exhibit relatively weak individual associations with household size, indicating that their strong relationship does not necessarily translate into accurate household-size prediction. This suggests that additional behavioral features or nonlinear modeling approaches may be necessary to distinguish between household-size categories.
+
+## Numerical checks and exploratory tables
+
+```{r numeric-summary}
+
+# The training outcome is included here only for exploration; test labels remain unused.
+
+summary_vars <- c("household_size", "n_purchase_rows", "total_spend",
+                  "mean_unit_price", "total_quantity", "unique_categories",
+                  "purchase_rows_per_month", "history_days")
+print(round(cor(as.data.frame(eda[, summary_vars]),
+                use="pairwise.complete.obs", method="spearman"), 3))
+print(eda %>% count(household_group, gender_group, name="respondents"))
+print(eda %>% group_by(household_group) %>%
+        summarise(n=n(), median_purchases=median(n_purchase_rows, na.rm=TRUE),
+                  median_spending=median(total_spend, na.rm=TRUE),
+                  median_categories=median(unique_categories, na.rm=TRUE),
+                  .groups="drop"))
+```
+
+## EDA conclusions and modeling implications
+
+The exploratory data analysis reveals several relationships between Amazon purchasing behavior and household size. Purchase volume, total spending, product-category diversity, total quantity, and purchasing frequency generally exhibit weak positive associations with household size. Purchasing frequency demonstrates the strongest association among these variables, although its Spearman correlation of 0.081 indicates limited predictive power individually.
+
+Additionally, substantial correlations exist among several purchasing variables, particularly purchase count, total quantity, and category diversity. These findings highlight potential multicollinearity and redundancy, which should be considered during model development. Log transformations may help address skewed distributions and extreme observations.
+
+Overall, the results suggest that no single purchasing variable adequately explains household size. Consequently, combining behavioral and demographic predictors and evaluating multiple regression approaches may improve predictive performance. Feature selection, regularization, and nonlinear models should be investigated using cross-validation to determine whether they offer meaningful improvements.
